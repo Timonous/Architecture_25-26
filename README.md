@@ -2,654 +2,1321 @@
 
 # **Проектирование архитектуры программных систем**
 
-# ***Лабораторная работа №3***
+# ***Лабораторная работа №4***
 
 ## 
 
 ## **Тема:**
 
-## Использование принципов проектирования на уровне методов и классов
+## Проектирование REST API
 
 ## **Цель:**
 
-## Получить опыт проектирования и реализации модулей с использованием принципов KISS, YAGNI, DRY, SOLID и др.
+## Получить опыт проектирования программного интерфейса.
 
-## **1. Диаграмма контейнеров**
-![c4_containers](Lab3/ДиаграмаКонтейнеров.png)
-
-## **2. Диаграмма компонентов контейнера "Сервис заказов"**
-![c4_components](Lab3/ДиаграммаКомпонентов.png)
-
-## **3. Диаграмма последовательностей**
-```mermaid
-sequenceDiagram
-    participant Client as Мобильное приложение покупателя
-    participant GW as API Gateway
-    participant OC as Order Controller
-    participant OS as Order Service
-    participant OR as Order Repository
-    participant OSM as Order Status Manager
-    participant OCM as Order Cache Manager
-    participant OEP as Order Event Publisher
-    participant DB as БД заказов
-    participant Cache as Кэш (Redis)
-    participant MB as Брокер сообщений
-
-    Client->>GW: POST /orders (состав заказа)
-    GW->>OC: Маршрутизация запроса
-
-    OC->>OS: Создать заказ
-
-    OS->>OR: Сохранить черновик заказа
-    OR->>DB: SQL INSERT (заказ со статусом "новый")
-    DB-->>OR: Заказ сохранён, order_id
-    OR-->>OS: order_id
-
-    OS->>OSM: Установить начальный статус "принят"
-    OSM->>OR: Обновить статус в БД
-    OR->>DB: SQL UPDATE status = "принят"
-    DB-->>OR: OK
-    OSM->>OCM: Обновить статус в кэше
-    OCM->>Cache: SET order:{id}:status = "принят"
-    Cache-->>OCM: OK
-
-    OS->>OEP: Опубликовать событие "заказ создан"
-    OEP->>MB: Async — событие {order_id, status, user_id}
-
-    OS-->>OC: Заказ успешно создан (order_id, статус)
-    OC-->>GW: HTTP 201 Created
-    GW-->>Client: Заказ принят, order_id, статус "принят"
-```
-Диаграмма описывает процесс взаимодействия компонентов Сервиса заказов:
-1. **Приём запроса**
-   Мобильное приложение отправляет `POST-запрос`. **API Gateway** маршрутизирует его в **Order Controller**, который передаёт управление в **Order Service**.
-2. **Сохранение заказа**
-   **Order Service** через **Order Repository** создаёт запись в БД заказов со статусом `новый`.
-3. **Установка статуса**
-   **Order Status Manager** переводит заказ в статус `принят`, обновляя одновременно:
-   * **БД** через **Order Repository**;
-   * **Кэш Redis** через **Order Cache Manager** (для быстрого чтения статуса клиентом).
-4. **Публикация события**
-   **Order Event Publisher** асинхронно отправляет в **Брокер сообщений** событие `заказ создан`. На него подписаны:
-   * **Сервис уведомлений** (отправка push-уведомления);
-   * **Сервис аналитики**.
-   *Обработка происходит независимо и не блокирует основной поток.*
-5. **Ответ клиенту**
-   **Order Service** возвращает результат вверх по цепочке. Клиент получает подтверждение с `order_id` и текущим статусом.
-
-## **4. Модель БД**
-```mermaid
-classDiagram
-    class User {
-        +Int id
-        +String name
-        +String email
-        +String phone
-        +String passwordHash
-        +Enum role
-        +DateTime createdAt
-    }
-
-    class Franchise {
-        +Int id
-        +String name
-        +String address
-        +String city
-        +String country
-        +Int ownerId
-        +Boolean isActive
-    }
-
-    class MenuItem {
-        +Int id
-        +Int franchiseId
-        +String name
-        +String description
-        +Decimal price
-        +Boolean isAvailable
-        +Boolean isNational
-    }
-
-    class Promotion {
-        +Int id
-        +Int franchiseId
-        +String title
-        +String description
-        +Decimal discountPercent
-        +Boolean isNational
-        +DateTime startsAt
-        +DateTime endsAt
-    }
-
-    class Order {
-        +Int id
-        +Int customerId
-        +Int franchiseId
-        +Int courierId
-        +Enum status
-        +Enum deliveryType
-        +Decimal totalPrice
-        +String deliveryAddress
-        +DateTime createdAt
-        +DateTime updatedAt
-    }
-
-    class OrderItem {
-        +Int id
-        +Int orderId
-        +Int menuItemId
-        +Integer quantity
-        +Decimal unitPrice
-    }
-
-    class Payment {
-        +Int id
-        +Int orderId
-        +Enum method
-        +Enum status
-        +Decimal amount
-        +String transactionId
-        +DateTime paidAt
-    }
-
-    class Delivery {
-        +Int id
-        +Int orderId
-        +Int courierId
-        +Enum status
-        +String routeUrl
-        +DateTime assignedAt
-        +DateTime deliveredAt
-    }
-
-    User "1" --> "0..*" Order : размещает
-    User "1" --> "0..*" Delivery : выполняет (курьер)
-    User "1" --> "0..*" Franchise : владеет
-    Franchise "1" --> "0..*" MenuItem : содержит
-    Franchise "1" --> "0..*" Promotion : публикует
-    Franchise "1" --> "0..*" Order : получает
-    Order "1" --> "1..*" OrderItem : включает
-    Order "1" --> "1" Payment : оплачивается
-    Order "1" --> "0..1" Delivery : доставляется
-    MenuItem "1" --> "0..*" OrderItem : входит в
-```
-## Описание сущностей системы
-### **User** — Универсальная сущность
-Используется для всех ролей системы.
-* **Поле `role`**: принимает значения `customer`, `courier`, `kitchen_staff`, `franchise_owner`, `admin`.
-* Позволяет хранить всех пользователей в одной таблице и разграничивать доступ.
-
-### **Franchise** — Магазин франшизы
-* Привязан к владельцу (`ownerId` → **User**).
-* Хранит географические данные для интеграции с картографическим сервисом.
-* **Поле `country`**: необходимо для поддержки международного расширения.
-
-### **MenuItem** — Позиция меню
-* **Флаг `isNational`**: разграничивает позиции материнской компании от локальных позиций конкретного магазина.
-* Привязка к `franchiseId` позволяет каждой франшизе формировать своё меню.
-
-### **Promotion** — Акция
-* Имеет флаг `isNational` (аналогично MenuItem): национальные акции создаёт материнская компания, локальные — владелец франшизы.
-* **Поля `startsAt` / `endsAt`**: задают временной период действия акции.
-
-### **Order** — Центральная сущность
-Связующее звено между покупателем, франшизой и курьером.
-* **Поле `status`**: жизненный цикл заказа (`new` → `accepted` → `preparing` → `ready` → `issued` / `delivered`).
-* **Поле `deliveryType`**: `pickup` (самовывоз) или `delivery` (доставка).
-
-### **OrderItem** — Позиция внутри заказа
-* **Поле `unitPrice`**: фиксирует цену на момент оформления заказа, чтобы последующие изменения в меню не влияли на историю заказов.
-
-### **Payment** — Платёж
-Связан «один к одному» с заказом.
-* **Поле `method`**: `online` / `cash`.
-* **Поле `status`**: `pending` → `success` / `failed`.
-* **Поле `transactionId`**: внешний идентификатор от платёжного провайдера.
-
-### **Delivery** — Доставка
-Создаётся только при условии `deliveryType = delivery`.
-* Содержит ссылку на курьера и текущий статус доставки.
-* **Поле `routeUrl`**: ссылка на построенный маршрут от картографического сервиса.
-
-## **5. Применение основных принципов разработки**
-## Контекст
- 
-Реализация относится к **Сервису заказов** платформы сэндвич-сети.  
-Код охватывает серверную часть (Node.js / TypeScript) и клиентскую часть (React / TypeScript).
- 
 ---
- 
-## 1. KISS — Keep It Simple, Stupid
- 
-> **Принцип:** каждый модуль должен решать одну задачу простым и понятным способом, без излишней сложности.
- 
-### Применение
- 
-Функция определения следующего статуса заказа написана как простой словарь переходов — без цепочек `if/else`, классов состояний или паттерна State там, где это было бы избыточно.
- 
-### Серверный код (Node.js / TypeScript)
- 
+
+## 1. Проектные решения
+
+### Решение 1 — Архитектурный стиль: REST
+
+**Описание:** API реализован в стиле REST (Representational State Transfer). Каждый ресурс идентифицируется URL-адресом, а действия над ним определяются HTTP-методами (GET, POST, PUT, DELETE).
+
+**Обоснование:** REST является стандартом де-факто для публичных и внутренних API микросервисов. Он хорошо поддерживается мобильными клиентами (React Native), веб-клиентами (React) и легко интегрируется с API Gateway (Kong / AWS API Gateway).
+
+---
+
+### Решение 2 — Версионирование через URL-префикс
+
+**Описание:** Все эндпоинты API содержат префикс версии: `/api/v1/...`. При выходе новой версии добавляется префикс `/api/v2/...`, старая версия продолжает работать параллельно в течение переходного периода.
+
+**Обоснование:** Версионирование через URL — наиболее очевидный и явный способ, понятный без изучения документации. Он позволяет клиентам (мобильным приложениям) постепенно мигрировать на новую версию без принудительного обновления.
+
+**Пример:**
+```
+/api/v1/orders      — текущая версия
+/api/v2/orders      — будущая версия (при необходимости)
+```
+
+---
+
+### Решение 3 — Формат данных: JSON
+
+**Описание:** Все запросы и ответы используют формат JSON (Content-Type: `application/json`). Клиент обязан передавать заголовок `Content-Type: application/json` в запросах с телом (POST, PUT). Сервер всегда возвращает `Content-Type: application/json`.
+
+**Обоснование:** JSON — универсальный формат для веб и мобильных приложений, нативно поддерживается JavaScript/TypeScript. Альтернативы (XML, Protobuf) избыточны для данного сценария.
+
+---
+
+### Решение 4 — Аутентификация через JWT Bearer Token
+
+**Описание:** Все эндпоинты (кроме публичных) требуют передачи JWT-токена в заголовке `Authorization`. Токен проверяется на уровне API Gateway до передачи запроса в сервис заказов.
+
+**Формат заголовка:**
+```
+Authorization: Bearer <jwt_token>
+```
+
+**Обоснование:** JWT позволяет хранить роль пользователя (`customer`, `kitchen_staff`, `franchise_owner`) непосредственно в токене, что исключает необходимость дополнительного запроса к сервису аутентификации при каждом вызове. Это соответствует принципу stateless REST.
+
+**Структура payload JWT:**
+```json
+{
+  "sub": "user-uuid",
+  "role": "customer",
+  "franchiseId": null,
+  "exp": 1700000000
+}
+```
+
+---
+
+### Решение 5 — Единая структура ответов
+
+**Описание:** Все ответы API, как успешные, так и ошибочные, возвращаются в единой обёртке. Это упрощает обработку ответов на клиенте.
+
+**Формат успешного ответа:**
+```json
+{
+  "success": true,
+  "data": { ... },
+  "meta": {
+    "timestamp": "2025-03-18T10:00:00Z"
+  }
+}
+```
+
+**Формат ответа с пагинацией:**
+```json
+{
+  "success": true,
+  "data": [ ... ],
+  "meta": {
+    "timestamp": "2025-03-18T10:00:00Z",
+    "pagination": {
+      "page": 1,
+      "limit": 20,
+      "total": 150,
+      "totalPages": 8
+    }
+  }
+}
+```
+
+**Формат ответа с ошибкой:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "ORDER_NOT_FOUND",
+    "message": "Заказ с указанным ID не найден",
+    "details": null
+  },
+  "meta": {
+    "timestamp": "2025-03-18T10:00:00Z"
+  }
+}
+```
+
+**Обоснование:** Единая структура позволяет клиенту всегда обращаться к `response.data` для получения данных и к `response.error` для обработки ошибок, не меняя логику парсинга в зависимости от эндпоинта.
+
+---
+
+### Решение 6 — Использование UUID как идентификаторов ресурсов
+
+**Описание:** Все идентификаторы ресурсов (заказы, пользователи, позиции) представляются в формате UUID v4.
+
+**Пример:** `3fa85f64-5717-4562-b3fc-2c963f66afa6`
+
+**Обоснование:** UUID исключает возможность угадывания идентификаторов (в отличие от автоинкрементных числовых ID), что повышает безопасность. Кроме того, UUID можно генерировать на клиенте без обращения к серверу, что упрощает оптимистичные обновления в мобильном приложении.
+
+---
+
+### Решение 7 — Коды HTTP-статусов по семантике операции
+
+**Описание:** API использует стандартные HTTP-статусы в строгом соответствии с семантикой операции.
+
+| Код | Ситуация |
+|-----|----------|
+| `200 OK` | Успешный GET, PUT |
+| `201 Created` | Успешный POST (создание ресурса) |
+| `204 No Content` | Успешный DELETE |
+| `400 Bad Request` | Ошибка валидации входных данных |
+| `401 Unauthorized` | Отсутствует или истёк JWT-токен |
+| `403 Forbidden` | Токен валиден, но роль не имеет прав |
+| `404 Not Found` | Ресурс не найден |
+| `409 Conflict` | Конфликт (например, недопустимый переход статуса) |
+| `422 Unprocessable Entity` | Данные корректны по формату, но не по бизнес-логике |
+| `500 Internal Server Error` | Непредвиденная ошибка сервера |
+
+**Обоснование:** Корректные HTTP-статусы позволяют API Gateway, мобильным клиентам и системам мониторинга реагировать на ответы без разбора тела ответа.
+
+---
+
+### Решение 8 — Пагинация через query-параметры
+
+**Описание:** Все эндпоинты, возвращающие списки, поддерживают пагинацию через query-параметры `page` и `limit`. Значения по умолчанию: `page=1`, `limit=20`. Максимальное значение `limit=100`.
+
+**Пример запроса:**
+```
+GET /api/v1/orders?page=2&limit=10
+```
+
+**Обоснование:** Ограничение выборки защищает сервер от запросов, возвращающих тысячи записей. Для мобильного приложения пагинация обеспечивает быструю загрузку первого экрана истории заказов.
+
+---
+
+### Решение 9 — Разграничение доступа на основе ролей (RBAC)
+
+**Описание:** Каждый эндпоинт доступен только определённым ролям. Роль извлекается из JWT-токена. Попытка вызова эндпоинта с недостаточными правами возвращает `403 Forbidden`.
+
+| Роль | Доступные операции |
+|------|--------------------|
+| `customer` | Создать заказ, просмотреть свои заказы |
+| `kitchen_staff` | Просмотреть заказы франшизы, обновить статус заказа |
+| `franchise_owner` | Просмотреть все заказы франшизы, назначить курьера |
+| `courier` | Просмотреть назначенные заказы |
+
+**Обоснование:** RBAC реализован на уровне самого сервиса (а не только на уровне Gateway), что обеспечивает защиту даже при обходе Gateway во внутренней сети.
+
+---
+
+## 2. Общие соглашения API
+
+**Base URL:** `https://api.sandwich-network.com/api/v1`
+
+**Обязательные заголовки для всех запросов:**
+
+| Заголовок | Значение | Обязателен |
+|-----------|----------|------------|
+| `Authorization` | `Bearer <jwt_token>` | Да (кроме публичных) |
+| `Content-Type` | `application/json` | Да (для POST, PUT) |
+| `Accept` | `application/json` | Рекомендуется |
+
+**Формат дат:** ISO 8601 (`2025-03-18T10:30:00Z`)
+
+**Коды ошибок бизнес-логики:**
+
+| Код | Описание |
+|-----|----------|
+| `ORDER_NOT_FOUND` | Заказ не найден |
+| `INVALID_STATUS_TRANSITION` | Недопустимый переход статуса |
+| `ORDER_ALREADY_PAID` | Заказ уже оплачен |
+| `FRANCHISE_NOT_FOUND` | Франшиза не найдена |
+| `VALIDATION_ERROR` | Ошибка валидации полей |
+| `ACCESS_DENIED` | Недостаточно прав для операции |
+
+---
+
+## 3. Описание эндпоинтов
+
+### 3.1 Создание заказа
+
+**Метод:** `POST`  
+**URL:** `/api/v1/orders`  
+**Роли:** `customer`  
+**Описание:** Создаёт новый заказ. Статус устанавливается автоматически как `new`. После создания в брокер сообщений публикуется событие `order.created`.
+
+**Заголовки запроса:**
+```
+Authorization: Bearer <jwt_token>
+Content-Type: application/json
+```
+
+**Тело запроса:**
+```json
+{
+  "franchiseId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+  "deliveryType": "delivery",
+  "deliveryAddress": "ул. Пушкина, д. 10, кв. 5, Москва",
+  "items": [
+    {
+      "menuItemId": "a1b2c3d4-1111-2222-3333-444455556666",
+      "quantity": 2,
+      "unitPrice": 350.00
+    },
+    {
+      "menuItemId": "b2c3d4e5-1111-2222-3333-444455557777",
+      "quantity": 1,
+      "unitPrice": 120.00
+    }
+  ]
+}
+```
+
+**Параметры тела запроса:**
+
+| Поле | Тип | Обязательное | Описание |
+|------|-----|:---:|---------|
+| `franchiseId` | `string (UUID)` | ✓ | ID магазина, в котором размещается заказ |
+| `deliveryType` | `enum: pickup \| delivery` | ✓ | Способ получения: самовывоз или доставка |
+| `deliveryAddress` | `string` | Только при `delivery` | Адрес доставки, макс. 500 символов |
+| `items` | `array` | ✓ | Список позиций заказа, минимум 1 элемент |
+| `items[].menuItemId` | `string (UUID)` | ✓ | ID позиции меню |
+| `items[].quantity` | `integer` | ✓ | Количество, от 1 до 99 |
+| `items[].unitPrice` | `number` | ✓ | Цена за единицу на момент заказа (в рублях) |
+
+**Успешный ответ `201 Created`:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "9c1b2a3d-4444-5555-6666-777788889999",
+    "customerId": "user-uuid-here",
+    "franchiseId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "status": "new",
+    "deliveryType": "delivery",
+    "deliveryAddress": "ул. Пушкина, д. 10, кв. 5, Москва",
+    "totalPrice": 820.00,
+    "items": [
+      {
+        "id": "item-uuid-1",
+        "menuItemId": "a1b2c3d4-1111-2222-3333-444455556666",
+        "quantity": 2,
+        "unitPrice": 350.00,
+        "subtotal": 700.00
+      },
+      {
+        "id": "item-uuid-2",
+        "menuItemId": "b2c3d4e5-1111-2222-3333-444455557777",
+        "quantity": 1,
+        "unitPrice": 120.00,
+        "subtotal": 120.00
+      }
+    ],
+    "createdAt": "2025-03-18T10:30:00Z",
+    "updatedAt": "2025-03-18T10:30:00Z"
+  },
+  "meta": {
+    "timestamp": "2025-03-18T10:30:00Z"
+  }
+}
+```
+
+**Ответ при ошибке валидации `400 Bad Request`:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Ошибка валидации входных данных",
+    "details": [
+      { "field": "items", "message": "Список позиций не может быть пустым" },
+      { "field": "deliveryAddress", "message": "Адрес доставки обязателен при типе delivery" }
+    ]
+  },
+  "meta": { "timestamp": "2025-03-18T10:30:00Z" }
+}
+```
+
+---
+
+### 3.2 Получение заказа по ID
+
+**Метод:** `GET`  
+**URL:** `/api/v1/orders/:orderId`  
+**Роли:** `customer` (только свои заказы), `kitchen_staff`, `franchise_owner`, `courier`  
+**Описание:** Возвращает полную информацию о заказе по его UUID. Покупатель может получить только свой заказ; сотрудники кухни и владельцы — только заказы своей франшизы.
+
+**Параметры пути:**
+
+| Параметр | Тип | Описание |
+|----------|-----|---------|
+| `orderId` | `string (UUID)` | Уникальный идентификатор заказа |
+
+**Пример запроса:**
+```
+GET /api/v1/orders/9c1b2a3d-4444-5555-6666-777788889999
+Authorization: Bearer <jwt_token>
+```
+
+**Успешный ответ `200 OK`:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "9c1b2a3d-4444-5555-6666-777788889999",
+    "customerId": "user-uuid-here",
+    "franchiseId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+    "courierId": null,
+    "status": "preparing",
+    "deliveryType": "delivery",
+    "deliveryAddress": "ул. Пушкина, д. 10, кв. 5, Москва",
+    "totalPrice": 820.00,
+    "items": [
+      {
+        "id": "item-uuid-1",
+        "menuItemId": "a1b2c3d4-1111-2222-3333-444455556666",
+        "menuItemName": "Классический сэндвич",
+        "quantity": 2,
+        "unitPrice": 350.00,
+        "subtotal": 700.00
+      }
+    ],
+    "createdAt": "2025-03-18T10:30:00Z",
+    "updatedAt": "2025-03-18T10:45:00Z"
+  },
+  "meta": { "timestamp": "2025-03-18T10:50:00Z" }
+}
+```
+
+**Ответ при отсутствии заказа `404 Not Found`:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "ORDER_NOT_FOUND",
+    "message": "Заказ с указанным ID не найден",
+    "details": null
+  },
+  "meta": { "timestamp": "2025-03-18T10:50:00Z" }
+}
+```
+
+---
+
+### 3.3 Получение списка заказов покупателя
+
+**Метод:** `GET`  
+**URL:** `/api/v1/orders`  
+**Роли:** `customer`  
+**Описание:** Возвращает историю заказов текущего авторизованного покупателя с поддержкой пагинации и фильтрации по статусу. Покупатель видит только свои заказы (ID извлекается из JWT).
+
+**Query-параметры:**
+
+| Параметр | Тип | Обязательный | По умолчанию | Описание |
+|----------|-----|:---:|:---:|---------|
+| `page` | `integer` | — | `1` | Номер страницы, минимум 1 |
+| `limit` | `integer` | — | `20` | Размер страницы, от 1 до 100 |
+| `status` | `enum` | — | все | Фильтр по статусу: `new`, `accepted`, `preparing`, `ready`, `issued` |
+
+**Пример запроса:**
+```
+GET /api/v1/orders?page=1&limit=5&status=preparing
+Authorization: Bearer <jwt_token>
+```
+
+**Успешный ответ `200 OK`:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "9c1b2a3d-4444-5555-6666-777788889999",
+      "franchiseId": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+      "status": "preparing",
+      "deliveryType": "delivery",
+      "totalPrice": 820.00,
+      "itemsCount": 2,
+      "createdAt": "2025-03-18T10:30:00Z"
+    }
+  ],
+  "meta": {
+    "timestamp": "2025-03-18T10:50:00Z",
+    "pagination": {
+      "page": 1,
+      "limit": 5,
+      "total": 1,
+      "totalPages": 1
+    }
+  }
+}
+```
+
+---
+
+### 3.4 Получение списка заказов франшизы
+
+**Метод:** `GET`  
+**URL:** `/api/v1/franchises/:franchiseId/orders`  
+**Роли:** `kitchen_staff`, `franchise_owner`  
+**Описание:** Возвращает список заказов конкретного магазина. Используется на панели кухни и в административной панели. Поддерживает фильтрацию по статусу и пагинацию.
+
+**Параметры пути:**
+
+| Параметр | Тип | Описание |
+|----------|-----|---------|
+| `franchiseId` | `string (UUID)` | ID магазина франшизы |
+
+**Query-параметры:**
+
+| Параметр | Тип | Обязательный | По умолчанию | Описание |
+|----------|-----|:---:|:---:|---------|
+| `page` | `integer` | — | `1` | Номер страницы |
+| `limit` | `integer` | — | `20` | Размер страницы, от 1 до 100 |
+| `status` | `enum` | — | все | Фильтр по статусу заказа |
+| `deliveryType` | `enum` | — | все | Фильтр: `pickup` или `delivery` |
+
+**Пример запроса:**
+```
+GET /api/v1/franchises/3fa85f64-5717-4562-b3fc-2c963f66afa6/orders?status=ready&limit=10
+Authorization: Bearer <jwt_token>
+```
+
+**Успешный ответ `200 OK`:**
+```json
+{
+  "success": true,
+  "data": [
+    {
+      "id": "9c1b2a3d-4444-5555-6666-777788889999",
+      "customerId": "user-uuid-here",
+      "status": "ready",
+      "deliveryType": "pickup",
+      "totalPrice": 350.00,
+      "itemsCount": 1,
+      "createdAt": "2025-03-18T11:00:00Z",
+      "updatedAt": "2025-03-18T11:20:00Z"
+    }
+  ],
+  "meta": {
+    "timestamp": "2025-03-18T11:25:00Z",
+    "pagination": {
+      "page": 1,
+      "limit": 10,
+      "total": 1,
+      "totalPages": 1
+    }
+  }
+}
+```
+
+---
+
+### 3.5 Обновление статуса заказа
+
+**Метод:** `PUT`  
+**URL:** `/api/v1/orders/:orderId/status`  
+**Роли:** `kitchen_staff`, `franchise_owner`  
+**Описание:** Изменяет статус заказа согласно допустимым переходам жизненного цикла. При успешном обновлении публикуется событие `order.status_changed` в брокер сообщений, что инициирует отправку push-уведомления покупателю.
+
+**Допустимые переходы статусов:**
+
+```
+new → accepted → preparing → ready → issued
+```
+
+Переход возможен только на следующий статус по цепочке. Обратные переходы запрещены.
+
+**Параметры пути:**
+
+| Параметр | Тип | Описание |
+|----------|-----|---------|
+| `orderId` | `string (UUID)` | ID заказа |
+
+**Тело запроса:**
+```json
+{
+  "status": "preparing"
+}
+```
+
+| Поле | Тип | Обязательное | Описание |
+|------|-----|:---:|---------|
+| `status` | `enum` | ✓ | Новый статус: `accepted`, `preparing`, `ready`, `issued` |
+
+**Успешный ответ `200 OK`:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "9c1b2a3d-4444-5555-6666-777788889999",
+    "previousStatus": "accepted",
+    "status": "preparing",
+    "updatedAt": "2025-03-18T11:10:00Z"
+  },
+  "meta": { "timestamp": "2025-03-18T11:10:00Z" }
+}
+```
+
+**Ответ при недопустимом переходе `409 Conflict`:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_STATUS_TRANSITION",
+    "message": "Недопустимый переход статуса: из 'ready' в 'accepted'",
+    "details": {
+      "currentStatus": "ready",
+      "requestedStatus": "accepted",
+      "allowedNextStatus": "issued"
+    }
+  },
+  "meta": { "timestamp": "2025-03-18T11:10:00Z" }
+}
+```
+
+---
+
+### 3.6 Назначение курьера на заказ
+
+**Метод:** `PUT`  
+**URL:** `/api/v1/orders/:orderId/courier`  
+**Роли:** `franchise_owner`  
+**Описание:** Назначает курьера на заказ с типом `delivery`. Может быть вызван только для заказов со статусом `ready`. После назначения курьер получает задание в своём мобильном приложении.
+
+**Параметры пути:**
+
+| Параметр | Тип | Описание |
+|----------|-----|---------|
+| `orderId` | `string (UUID)` | ID заказа |
+
+**Тело запроса:**
+```json
+{
+  "courierId": "courier-uuid-here"
+}
+```
+
+| Поле | Тип | Обязательное | Описание |
+|------|-----|:---:|---------|
+| `courierId` | `string (UUID)` | ✓ | ID пользователя с ролью `courier` |
+
+**Успешный ответ `200 OK`:**
+```json
+{
+  "success": true,
+  "data": {
+    "id": "9c1b2a3d-4444-5555-6666-777788889999",
+    "courierId": "courier-uuid-here",
+    "status": "ready",
+    "updatedAt": "2025-03-18T11:30:00Z"
+  },
+  "meta": { "timestamp": "2025-03-18T11:30:00Z" }
+}
+```
+
+**Ответ при ошибке `422 Unprocessable Entity`:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "VALIDATION_ERROR",
+    "message": "Курьер может быть назначен только на заказ типа delivery со статусом ready",
+    "details": {
+      "orderId": "9c1b2a3d-4444-5555-6666-777788889999",
+      "currentDeliveryType": "pickup",
+      "currentStatus": "preparing"
+    }
+  },
+  "meta": { "timestamp": "2025-03-18T11:30:00Z" }
+}
+```
+
+---
+
+### 3.7 Отмена заказа
+
+**Метод:** `DELETE`  
+**URL:** `/api/v1/orders/:orderId`  
+**Роли:** `customer` (только свои заказы, только статус `new`), `franchise_owner`  
+**Описание:** Отменяет заказ. Покупатель может отменить только заказ в статусе `new` (до принятия кухней). Владелец франшизы может отменить заказ в статусах `new` и `accepted`. Публикуется событие `order.cancelled`.
+
+**Параметры пути:**
+
+| Параметр | Тип | Описание |
+|----------|-----|---------|
+| `orderId` | `string (UUID)` | ID заказа |
+
+**Пример запроса:**
+```
+DELETE /api/v1/orders/9c1b2a3d-4444-5555-6666-777788889999
+Authorization: Bearer <jwt_token>
+```
+
+**Успешный ответ `204 No Content`:**
+```
+HTTP/1.1 204 No Content
+```
+*(тело ответа отсутствует)*
+
+**Ответ при недопустимой отмене `409 Conflict`:**
+```json
+{
+  "success": false,
+  "error": {
+    "code": "INVALID_STATUS_TRANSITION",
+    "message": "Заказ в статусе 'preparing' не может быть отменён покупателем",
+    "details": {
+      "currentStatus": "preparing",
+      "allowedStatuses": ["new"]
+    }
+  },
+  "meta": { "timestamp": "2025-03-18T11:40:00Z" }
+}
+```
+
+---
+
+## 4. Реализация API
+
+### Стек технологий
+
+- **Runtime:** Node.js 20 LTS
+- **Фреймворк:** Express 4 + TypeScript
+- **Валидация:** Zod
+- **БД:** PostgreSQL (через абстракцию репозитория)
+
+---
+
+### 4.1 Типы и интерфейсы
+
 ```typescript
-// server/order/getNextStatus.ts
- 
-type OrderStatus = "new" | "accepted" | "preparing" | "ready" | "issued";
- 
-// KISS: простой словарь вместо сложной машины состояний
-const STATUS_TRANSITIONS: Record<OrderStatus, OrderStatus | null> = {
+// src/types/order.types.ts
+
+export type OrderStatus = "new" | "accepted" | "preparing" | "ready" | "issued";
+export type DeliveryType = "pickup" | "delivery";
+export type UserRole = "customer" | "kitchen_staff" | "franchise_owner" | "courier";
+
+export interface JwtPayload {
+  sub: string;          // userId
+  role: UserRole;
+  franchiseId: string | null;
+}
+
+export interface OrderItem {
+  id: string;
+  menuItemId: string;
+  quantity: number;
+  unitPrice: number;
+  subtotal: number;
+}
+
+export interface Order {
+  id: string;
+  customerId: string;
+  franchiseId: string;
+  courierId: string | null;
+  status: OrderStatus;
+  deliveryType: DeliveryType;
+  deliveryAddress: string | null;
+  totalPrice: number;
+  items: OrderItem[];
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+// Интерфейсы репозитория и публикатора (DIP)
+export interface IOrderRepository {
+  save(order: Omit<Order, "id" | "createdAt" | "updatedAt">): Promise<Order>;
+  findById(id: string): Promise<Order | null>;
+  findByCustomer(customerId: string, page: number, limit: number, status?: OrderStatus): Promise<{ data: Order[]; total: number }>;
+  findByFranchise(franchiseId: string, page: number, limit: number, status?: OrderStatus, deliveryType?: DeliveryType): Promise<{ data: Order[]; total: number }>;
+  updateStatus(id: string, status: OrderStatus): Promise<Order>;
+  assignCourier(id: string, courierId: string): Promise<Order>;
+  delete(id: string): Promise<void>;
+}
+
+export interface IEventPublisher {
+  publish(event: string, payload: Record<string, unknown>): Promise<void>;
+}
+```
+
+---
+
+### 4.2 Утилиты: формирование ответов и пагинация
+
+```typescript
+// src/utils/response.ts
+
+import { Response } from "express";
+
+interface ApiMeta {
+  timestamp: string;
+  pagination?: {
+    page: number;
+    limit: number;
+    total: number;
+    totalPages: number;
+  };
+}
+
+// DRY: единая функция формирования успешного ответа
+export function sendSuccess<T>(
+  res: Response,
+  data: T,
+  statusCode: number = 200,
+  pagination?: { page: number; limit: number; total: number }
+): void {
+  const meta: ApiMeta = { timestamp: new Date().toISOString() };
+
+  if (pagination) {
+    meta.pagination = {
+      ...pagination,
+      totalPages: Math.ceil(pagination.total / pagination.limit),
+    };
+  }
+
+  res.status(statusCode).json({ success: true, data, meta });
+}
+
+// DRY: единая функция формирования ответа с ошибкой
+export function sendError(
+  res: Response,
+  statusCode: number,
+  code: string,
+  message: string,
+  details: unknown = null
+): void {
+  res.status(statusCode).json({
+    success: false,
+    error: { code, message, details },
+    meta: { timestamp: new Date().toISOString() },
+  });
+}
+```
+
+---
+
+### 4.3 Middleware: аутентификация и авторизация
+
+```typescript
+// src/middleware/auth.ts
+
+import { Request, Response, NextFunction } from "express";
+import jwt from "jsonwebtoken";
+import { JwtPayload, UserRole } from "../types/order.types";
+import { sendError } from "../utils/response";
+
+// Расширение типа Request для хранения данных пользователя
+declare global {
+  namespace Express {
+    interface Request {
+      user?: JwtPayload;
+    }
+  }
+}
+
+// SRP: middleware отвечает только за проверку токена
+export function authenticate(req: Request, res: Response, next: NextFunction): void {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader?.startsWith("Bearer ")) {
+    sendError(res, 401, "UNAUTHORIZED", "Требуется авторизация");
+    return;
+  }
+
+  const token = authHeader.slice(7);
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET!) as JwtPayload;
+    req.user = payload;
+    next();
+  } catch {
+    sendError(res, 401, "UNAUTHORIZED", "Токен недействителен или истёк");
+  }
+}
+
+// OCP: функция расширяема — достаточно передать новые роли
+export function authorize(...roles: UserRole[]) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      sendError(res, 403, "ACCESS_DENIED", "Недостаточно прав для выполнения операции");
+      return;
+    }
+    next();
+  };
+}
+```
+
+---
+
+### 4.4 Валидация схем входных данных (Zod)
+
+```typescript
+// src/validators/order.validators.ts
+
+import { z } from "zod";
+
+// KISS: схемы валидации описывают структуру лаконично и читаемо
+export const createOrderSchema = z.object({
+  franchiseId: z.string().uuid("franchiseId должен быть валидным UUID"),
+  deliveryType: z.enum(["pickup", "delivery"]),
+  deliveryAddress: z.string().max(500).optional(),
+  items: z
+    .array(
+      z.object({
+        menuItemId: z.string().uuid(),
+        quantity: z.number().int().min(1).max(99),
+        unitPrice: z.number().positive(),
+      })
+    )
+    .min(1, "Список позиций не может быть пустым"),
+}).refine(
+  (data) => data.deliveryType === "pickup" || !!data.deliveryAddress,
+  { message: "Адрес доставки обязателен при типе delivery", path: ["deliveryAddress"] }
+);
+
+export const updateStatusSchema = z.object({
+  status: z.enum(["accepted", "preparing", "ready", "issued"]),
+});
+
+export const assignCourierSchema = z.object({
+  courierId: z.string().uuid("courierId должен быть валидным UUID"),
+});
+
+export const paginationSchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(100).default(20),
+  status: z.enum(["new", "accepted", "preparing", "ready", "issued"]).optional(),
+  deliveryType: z.enum(["pickup", "delivery"]).optional(),
+});
+```
+
+---
+
+### 4.5 Бизнес-логика: сервис заказов
+
+```typescript
+// src/services/OrderService.ts
+
+import { v4 as uuidv4 } from "uuid";
+import {
+  Order, OrderStatus, IOrderRepository, IEventPublisher, DeliveryType
+} from "../types/order.types";
+
+// Допустимые переходы статусов (KISS)
+const STATUS_TRANSITIONS: Partial<Record<OrderStatus, OrderStatus>> = {
   new:       "accepted",
   accepted:  "preparing",
   preparing: "ready",
   ready:     "issued",
-  issued:    null,
 };
- 
-export function getNextStatus(current: OrderStatus): OrderStatus | null {
-  return STATUS_TRANSITIONS[current] ?? null;
-}
-```
- 
-### Пояснение
- 
-Вместо введения паттерна State или цепочки условий используется единственная структура данных — объект-словарь. Логика переходов очевидна с первого взгляда, легко тестируется и расширяется добавлением одной строки.
- 
----
- 
-## 2. YAGNI — You Aren't Gonna Need It
- 
-> **Принцип:** не реализовывать функциональность, которая не нужна прямо сейчас.
- 
-### Применение
- 
-При создании заказа реализуется только то, что требуется согласно текущим требованиям: сохранение заказа и публикация события. Поддержка приоритетов заказов, группировки и планировщика не добавляется, пока этого не требуют спецификации.
- 
-### Серверный код (Node.js / TypeScript)
- 
-```typescript
-// server/order/createOrder.ts
- 
-interface CreateOrderDTO {
-  customerId: string;
-  franchiseId: string;
-  items: { menuItemId: string; quantity: number; unitPrice: number }[];
-}
- 
-interface Order {
-  id: string;
-  customerId: string;
-  franchiseId: string;
-  status: "new";
-  totalPrice: number;
-  items: CreateOrderDTO["items"];
-  createdAt: Date;
-}
- 
-// YAGNI: только необходимые поля — без приоритетов, тегов, групп и планировщика
-async function createOrder(
-  dto: CreateOrderDTO,
-  repo: OrderRepository,
-  publisher: EventPublisher
-): Promise<Order> {
-  const totalPrice = dto.items.reduce(
-    (sum, item) => sum + item.unitPrice * item.quantity,
-    0
-  );
- 
-  const order = await repo.save({
-    ...dto,
-    status: "new",
-    totalPrice,
-    createdAt: new Date(),
-  });
- 
-  await publisher.publish("order.created", { orderId: order.id });
- 
-  return order;
-}
-```
- 
-### Пояснение
- 
-DTO содержит только поля, необходимые для создания заказа. Такие атрибуты, как `priority`, `scheduledAt`, `tags` и т.п., не добавляются, пока они не определены в требованиях. Это уменьшает сложность модели и предотвращает разрастание схемы БД.
- 
----
- 
-## 3. DRY — Don't Repeat Yourself
- 
-> **Принцип:** каждый фрагмент знания должен иметь единственное представление в системе.
- 
-### Применение
- 
-Логика форматирования статуса заказа для отображения пользователю вынесена в единую функцию/хук, используемый на всех экранах клиентского приложения.
- 
-### Клиентский код (React / TypeScript)
- 
-```typescript
-// client/utils/formatOrderStatus.ts
- 
-type OrderStatus = "new" | "accepted" | "preparing" | "ready" | "issued";
- 
-// DRY: единственное место определения русских названий статусов
-const STATUS_LABELS: Record<OrderStatus, string> = {
-  new:       "Новый",
-  accepted:  "Принят",
-  preparing: "Готовится",
-  ready:     "Готов",
-  issued:    "Выдан",
-};
- 
-const STATUS_COLORS: Record<OrderStatus, string> = {
-  new:       "#9E9E9E",
-  accepted:  "#2196F3",
-  preparing: "#FF9800",
-  ready:     "#4CAF50",
-  issued:    "#757575",
-};
- 
-export function getStatusLabel(status: OrderStatus): string {
-  return STATUS_LABELS[status];
-}
- 
-export function getStatusColor(status: OrderStatus): string {
-  return STATUS_COLORS[status];
-}
-```
- 
-```tsx
-// client/components/OrderStatusBadge.tsx
- 
-import { getStatusLabel, getStatusColor } from "../utils/formatOrderStatus";
- 
-// DRY: компонент использует единый источник данных о статусах
-export function OrderStatusBadge({ status }: { status: OrderStatus }) {
-  return (
-    <span style={{ color: getStatusColor(status) }}>
-      {getStatusLabel(status)}
-    </span>
-  );
-}
-```
- 
-### Пояснение
- 
-До применения DRY строки «Готовится», «Принят» и цвета были продублированы в нескольких компонентах: экране заказов покупателя, панели кухни и экране курьера. Теперь при изменении названия статуса достаточно исправить одну строку в `formatOrderStatus.ts`.
- 
----
- 
-## 4. SOLID
- 
-### 4.1 S — Single Responsibility Principle
- 
-> **Принцип:** каждый класс / модуль должен иметь только одну причину для изменения.
- 
-#### Применение
- 
-Репозиторий заказов отвечает только за персистентность данных. Бизнес-логика (расчёт стоимости, переходы статусов) вынесена в отдельные модули.
- 
-```typescript
-// server/order/OrderRepository.ts
- 
-// SRP: класс отвечает только за операции с БД — без бизнес-логики
-export class OrderRepository {
-  constructor(private readonly db: DatabaseClient) {}
- 
-  async save(order: Omit<Order, "id">): Promise<Order> {
-    const result = await this.db.query(
-      `INSERT INTO orders (customer_id, franchise_id, status, total_price, created_at)
-       VALUES ($1, $2, $3, $4, $5) RETURNING *`,
-      [order.customerId, order.franchiseId, order.status, order.totalPrice, order.createdAt]
-    );
-    return result.rows[0];
-  }
- 
-  async findById(id: string): Promise<Order | null> {
-    const result = await this.db.query(
-      `SELECT * FROM orders WHERE id = $1`,
-      [id]
-    );
-    return result.rows[0] ?? null;
-  }
- 
-  async updateStatus(id: string, status: OrderStatus): Promise<void> {
-    await this.db.query(
-      `UPDATE orders SET status = $1, updated_at = NOW() WHERE id = $2`,
-      [status, id]
-    );
-  }
-}
-```
- 
-#### Пояснение
- 
-`OrderRepository` изменяется только по одной причине — при изменении схемы БД или драйвера. Бизнес-правила хранятся в `OrderService`, а логика событий — в `OrderEventPublisher`.
- 
----
- 
-### 4.2 O — Open/Closed Principle
- 
-> **Принцип:** модули открыты для расширения, но закрыты для изменения.
- 
-#### Применение
- 
-Система уведомлений реализована через абстракцию. Добавление нового канала (e-mail, SMS) не требует изменения существующего кода.
- 
-```typescript
-// server/notifications/NotificationSender.ts
- 
-// OCP: интерфейс закрыт для изменений, открыт для новых реализаций
-export interface NotificationSender {
-  send(userId: string, message: string): Promise<void>;
-}
- 
-// Реализация 1: push-уведомления (текущий канал)
-export class PushNotificationSender implements NotificationSender {
-  async send(userId: string, message: string): Promise<void> {
-    // Отправка через FCM/APNs
-    console.log(`[PUSH] → ${userId}: ${message}`);
-  }
-}
- 
-// Реализация 2: email (добавляется без изменения существующих классов)
-export class EmailNotificationSender implements NotificationSender {
-  async send(userId: string, message: string): Promise<void> {
-    // Отправка через SMTP
-    console.log(`[EMAIL] → ${userId}: ${message}`);
-  }
-}
- 
-// Потребитель зависит от интерфейса, а не от конкретной реализации
-export class NotificationService {
-  constructor(private readonly sender: NotificationSender) {}
- 
-  async notifyOrderReady(userId: string, orderId: string): Promise<void> {
-    await this.sender.send(userId, `Ваш заказ #${orderId} готов!`);
-  }
-}
-```
- 
-#### Пояснение
- 
-При добавлении SMS-уведомлений создаётся новый класс `SmsNotificationSender`, реализующий тот же интерфейс. `NotificationService` не изменяется. Конкретная реализация подставляется через Dependency Injection при инициализации сервиса.
- 
----
- 
-### 4.3 L — Liskov Substitution Principle
- 
-> **Принцип:** подтипы должны быть заменяемы своими базовыми типами без нарушения корректности программы.
- 
-#### Применение
- 
-Любая реализация `OrderRepository` (реальная PostgreSQL и тестовая in-memory) должна вести себя одинаково с точки зрения вызывающего кода.
- 
-```typescript
-// server/order/IOrderRepository.ts
- 
-// LSP: контракт, которому обязаны следовать все реализации
-export interface IOrderRepository {
-  save(order: Omit<Order, "id">): Promise<Order>;
-  findById(id: string): Promise<Order | null>;
-  updateStatus(id: string, status: OrderStatus): Promise<void>;
-}
- 
-// Реальная реализация (PostgreSQL)
-export class PostgresOrderRepository implements IOrderRepository {
-  async save(order: Omit<Order, "id">): Promise<Order> {
-    // SQL INSERT...
-    return { id: "uuid-from-db", ...order } as Order;
-  }
-  async findById(id: string): Promise<Order | null> {
-    // SQL SELECT...
-    return null;
-  }
-  async updateStatus(id: string, status: OrderStatus): Promise<void> {
-    // SQL UPDATE...
-  }
-}
- 
-// LSP: in-memory реализация полностью взаимозаменяема с PostgresOrderRepository
-export class InMemoryOrderRepository implements IOrderRepository {
-  private store = new Map<string, Order>();
- 
-  async save(order: Omit<Order, "id">): Promise<Order> {
-    const saved = { id: crypto.randomUUID(), ...order } as Order;
-    this.store.set(saved.id, saved);
-    return saved;
-  }
-  async findById(id: string): Promise<Order | null> {
-    return this.store.get(id) ?? null;
-  }
-  async updateStatus(id: string, status: OrderStatus): Promise<void> {
-    const order = this.store.get(id);
-    if (order) this.store.set(id, { ...order, status });
-  }
-}
-```
- 
-#### Пояснение
- 
-`OrderService` принимает `IOrderRepository` и не знает, с какой реализацией работает. В тестах подставляется `InMemoryOrderRepository` — поведение с точки зрения бизнес-логики идентично. LSP гарантирует, что замена реализации не сломает код.
- 
----
- 
-### 4.4 I — Interface Segregation Principle
- 
-> **Принцип:** клиенты не должны зависеть от методов, которые они не используют.
- 
-#### Применение
- 
-Вместо одного большого интерфейса `IOrderService` созданы отдельные интерфейсы для разных ролей.
- 
-```typescript
-// server/order/interfaces.ts
- 
-// ISP: сотруднику кухни не нужно знать о создании заказа
-export interface IOrderReader {
-  findById(id: string): Promise<Order | null>;
-  listByFranchise(franchiseId: string): Promise<Order[]>;
-}
- 
-export interface IOrderCreator {
-  createOrder(dto: CreateOrderDTO): Promise<Order>;
-}
- 
-export interface IOrderStatusUpdater {
-  updateStatus(orderId: string, status: OrderStatus): Promise<void>;
-}
- 
-// Покупатель использует только создание и чтение
-export class CustomerOrderFacade implements IOrderCreator, IOrderReader {
-  constructor(private readonly service: OrderService) {}
- 
-  async createOrder(dto: CreateOrderDTO): Promise<Order> {
-    return this.service.createOrder(dto);
-  }
-  async findById(id: string): Promise<Order | null> {
-    return this.service.findById(id);
-  }
-  async listByFranchise(franchiseId: string): Promise<Order[]> {
-    return this.service.listByFranchise(franchiseId);
-  }
-}
- 
-// Сотрудник кухни использует только обновление статуса и чтение
-export class KitchenOrderFacade implements IOrderStatusUpdater, IOrderReader {
-  constructor(private readonly service: OrderService) {}
- 
-  async updateStatus(orderId: string, status: OrderStatus): Promise<void> {
-    return this.service.updateStatus(orderId, status);
-  }
-  async findById(id: string): Promise<Order | null> {
-    return this.service.findById(id);
-  }
-  async listByFranchise(franchiseId: string): Promise<Order[]> {
-    return this.service.listByFranchise(franchiseId);
-  }
-}
-```
- 
-#### Пояснение
- 
-Сотрудник кухни работает через `KitchenOrderFacade` и видит только `updateStatus` и `findById` — метод `createOrder` для него недоступен на уровне интерфейса. Покупатель работает через `CustomerOrderFacade`. Изменение интерфейса создания заказа не затрагивает код кухни.
- 
----
- 
-### 4.5 D — Dependency Inversion Principle
- 
-> **Принцип:** модули верхнего уровня не должны зависеть от модулей нижнего уровня. Оба должны зависеть от абстракций.
- 
-#### Применение
- 
-`OrderService` (высокий уровень) зависит от интерфейсов `IOrderRepository` и `EventPublisher`, а не от конкретных классов `PostgresOrderRepository` или `RabbitMQPublisher`.
- 
-```typescript
-// server/order/OrderService.ts
- 
-// DIP: зависимости передаются через конструктор как интерфейсы
+
+// SRP: класс отвечает только за бизнес-логику заказов
+// DIP: зависит от интерфейсов, а не от конкретных реализаций
 export class OrderService {
   constructor(
-    private readonly repo: IOrderRepository,       // абстракция, не PostgresOrderRepository
-    private readonly publisher: EventPublisher,     // абстракция, не RabbitMQPublisher
-    private readonly statusManager: IOrderStatusManager
+    private readonly repo: IOrderRepository,
+    private readonly publisher: IEventPublisher
   ) {}
- 
-  async createOrder(dto: CreateOrderDTO): Promise<Order> {
+
+  // POST /orders
+  async createOrder(dto: {
+    customerId: string;
+    franchiseId: string;
+    deliveryType: DeliveryType;
+    deliveryAddress?: string;
+    items: { menuItemId: string; quantity: number; unitPrice: number }[];
+  }): Promise<Order> {
     const totalPrice = dto.items.reduce(
       (sum, item) => sum + item.unitPrice * item.quantity,
       0
     );
- 
-    const order = await this.repo.save({ ...dto, status: "new", totalPrice, createdAt: new Date() });
-    await this.statusManager.transition(order.id, "accepted");
-    await this.publisher.publish("order.created", { orderId: order.id });
- 
+
+    const order = await this.repo.save({
+      ...dto,
+      courierId: null,
+      status: "new",
+      totalPrice,
+      deliveryAddress: dto.deliveryAddress ?? null,
+      items: dto.items.map((item) => ({
+        id: uuidv4(),
+        ...item,
+        subtotal: item.unitPrice * item.quantity,
+      })),
+    });
+
+    await this.publisher.publish("order.created", {
+      orderId: order.id,
+      customerId: order.customerId,
+      franchiseId: order.franchiseId,
+    });
+
     return order;
   }
+
+  // GET /orders/:orderId
+  async getOrderById(orderId: string, requesterId: string, requesterRole: string): Promise<Order> {
+    const order = await this.repo.findById(orderId);
+
+    if (!order) {
+      throw { code: "ORDER_NOT_FOUND", status: 404, message: "Заказ не найден" };
+    }
+
+    // Покупатель видит только свои заказы
+    if (requesterRole === "customer" && order.customerId !== requesterId) {
+      throw { code: "ACCESS_DENIED", status: 403, message: "Нет доступа к этому заказу" };
+    }
+
+    return order;
+  }
+
+  // GET /orders (история покупателя)
+  async getCustomerOrders(
+    customerId: string,
+    page: number,
+    limit: number,
+    status?: OrderStatus
+  ): Promise<{ data: Order[]; total: number }> {
+    return this.repo.findByCustomer(customerId, page, limit, status);
+  }
+
+  // GET /franchises/:franchiseId/orders
+  async getFranchiseOrders(
+    franchiseId: string,
+    page: number,
+    limit: number,
+    status?: OrderStatus,
+    deliveryType?: DeliveryType
+  ): Promise<{ data: Order[]; total: number }> {
+    return this.repo.findByFranchise(franchiseId, page, limit, status, deliveryType);
+  }
+
+  // PUT /orders/:orderId/status
+  async updateStatus(orderId: string, newStatus: OrderStatus): Promise<Order> {
+    const order = await this.repo.findById(orderId);
+
+    if (!order) {
+      throw { code: "ORDER_NOT_FOUND", status: 404, message: "Заказ не найден" };
+    }
+
+    const allowedNext = STATUS_TRANSITIONS[order.status];
+
+    if (allowedNext !== newStatus) {
+      throw {
+        code: "INVALID_STATUS_TRANSITION",
+        status: 409,
+        message: `Недопустимый переход статуса: из '${order.status}' в '${newStatus}'`,
+        details: { currentStatus: order.status, requestedStatus: newStatus, allowedNextStatus: allowedNext ?? null },
+      };
+    }
+
+    const updated = await this.repo.updateStatus(orderId, newStatus);
+
+    await this.publisher.publish("order.status_changed", {
+      orderId: updated.id,
+      customerId: updated.customerId,
+      previousStatus: order.status,
+      newStatus,
+    });
+
+    return updated;
+  }
+
+  // PUT /orders/:orderId/courier
+  async assignCourier(orderId: string, courierId: string): Promise<Order> {
+    const order = await this.repo.findById(orderId);
+
+    if (!order) {
+      throw { code: "ORDER_NOT_FOUND", status: 404, message: "Заказ не найден" };
+    }
+
+    if (order.deliveryType !== "delivery" || order.status !== "ready") {
+      throw {
+        code: "VALIDATION_ERROR",
+        status: 422,
+        message: "Курьер может быть назначен только на заказ типа delivery со статусом ready",
+        details: { currentDeliveryType: order.deliveryType, currentStatus: order.status },
+      };
+    }
+
+    return this.repo.assignCourier(orderId, courierId);
+  }
+
+  // DELETE /orders/:orderId
+  async cancelOrder(orderId: string, requesterId: string, requesterRole: string): Promise<void> {
+    const order = await this.repo.findById(orderId);
+
+    if (!order) {
+      throw { code: "ORDER_NOT_FOUND", status: 404, message: "Заказ не найден" };
+    }
+
+    const allowedStatuses: OrderStatus[] =
+      requesterRole === "customer" ? ["new"] : ["new", "accepted"];
+
+    if (!allowedStatuses.includes(order.status)) {
+      throw {
+        code: "INVALID_STATUS_TRANSITION",
+        status: 409,
+        message: `Заказ в статусе '${order.status}' не может быть отменён`,
+        details: { currentStatus: order.status, allowedStatuses },
+      };
+    }
+
+    if (requesterRole === "customer" && order.customerId !== requesterId) {
+      throw { code: "ACCESS_DENIED", status: 403, message: "Нет доступа к этому заказу" };
+    }
+
+    await this.repo.delete(orderId);
+
+    await this.publisher.publish("order.cancelled", {
+      orderId,
+      cancelledBy: requesterId,
+    });
+  }
 }
- 
-// Сборка зависимостей происходит снаружи (Composition Root)
-// server/index.ts
- 
-const db = new DatabaseClient(process.env.DATABASE_URL!);
-const repo = new PostgresOrderRepository(db);
-const publisher = new RabbitMQPublisher(process.env.RABBITMQ_URL!);
-const statusManager = new OrderStatusManager(repo, new RedisOrderCacheManager());
-const orderService = new OrderService(repo, publisher, statusManager);
 ```
- 
-#### Пояснение
- 
-`OrderService` не создаёт зависимости сам — он получает их снаружи. Это позволяет в тестах подставить `InMemoryOrderRepository` и `InMemoryPublisher`, а в продакшене — реальные реализации. При замене RabbitMQ на Kafka изменяется только Composition Root, бизнес-логика не трогается.
- 
+
 ---
- 
-## Итоговая таблица
- 
-| Принцип | Где применён | Эффект |
-|---|---|---|
-| **KISS** | `getNextStatus` — словарь переходов | Читаемость, простота тестирования |
-| **YAGNI** | `CreateOrderDTO` — только нужные поля | Меньше кода, проще схема БД |
-| **DRY** | `formatOrderStatus` — единый источник названий | Правка в одном месте вместо N компонентов |
-| **SRP** | `OrderRepository` — только персистентность | Независимые причины изменения |
-| **OCP** | `NotificationSender` — интерфейс + реализации | Добавление канала без изменения кода |
-| **LSP** | `InMemoryOrderRepository` заменяет PostgreSQL | Тестируемость без реальной БД |
-| **ISP** | `KitchenOrderFacade` / `CustomerOrderFacade` | Минимальный интерфейс для каждой роли |
-| **DIP** | `OrderService` зависит от интерфейсов | Замена инфраструктуры без правки логики |
+
+### 4.6 Контроллер и маршруты
+
+```typescript
+// src/controllers/OrderController.ts
+
+import { Request, Response } from "express";
+import { OrderService } from "../services/OrderService";
+import { sendSuccess, sendError } from "../utils/response";
+import {
+  createOrderSchema,
+  updateStatusSchema,
+  assignCourierSchema,
+  paginationSchema,
+} from "../validators/order.validators";
+import { OrderStatus } from "../types/order.types";
+
+// SRP: контроллер отвечает только за HTTP-слой (парсинг, вызов сервиса, ответ)
+export class OrderController {
+  constructor(private readonly orderService: OrderService) {}
+
+  // POST /api/v1/orders
+  createOrder = async (req: Request, res: Response): Promise<void> => {
+    const parsed = createOrderSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Ошибка валидации входных данных",
+        parsed.error.errors.map((e) => ({ field: e.path.join("."), message: e.message }))
+      );
+      return;
+    }
+
+    try {
+      const order = await this.orderService.createOrder({
+        customerId: req.user!.sub,
+        ...parsed.data,
+      });
+      sendSuccess(res, order, 201);
+    } catch (err: any) {
+      sendError(res, err.status ?? 500, err.code ?? "INTERNAL_ERROR", err.message, err.details);
+    }
+  };
+
+  // GET /api/v1/orders/:orderId
+  getOrderById = async (req: Request, res: Response): Promise<void> => {
+    try {
+      const order = await this.orderService.getOrderById(
+        req.params.orderId,
+        req.user!.sub,
+        req.user!.role
+      );
+      sendSuccess(res, order);
+    } catch (err: any) {
+      sendError(res, err.status ?? 500, err.code ?? "INTERNAL_ERROR", err.message, err.details);
+    }
+  };
+
+  // GET /api/v1/orders
+  getCustomerOrders = async (req: Request, res: Response): Promise<void> => {
+    const parsed = paginationSchema.safeParse(req.query);
+
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Некорректные параметры запроса");
+      return;
+    }
+
+    try {
+      const { page, limit, status } = parsed.data;
+      const result = await this.orderService.getCustomerOrders(
+        req.user!.sub, page, limit, status as OrderStatus
+      );
+      sendSuccess(res, result.data, 200, { page, limit, total: result.total });
+    } catch (err: any) {
+      sendError(res, err.status ?? 500, err.code ?? "INTERNAL_ERROR", err.message);
+    }
+  };
+
+  // GET /api/v1/franchises/:franchiseId/orders
+  getFranchiseOrders = async (req: Request, res: Response): Promise<void> => {
+    const parsed = paginationSchema.safeParse(req.query);
+
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Некорректные параметры запроса");
+      return;
+    }
+
+    try {
+      const { page, limit, status, deliveryType } = parsed.data;
+      const result = await this.orderService.getFranchiseOrders(
+        req.params.franchiseId, page, limit, status as OrderStatus, deliveryType
+      );
+      sendSuccess(res, result.data, 200, { page, limit, total: result.total });
+    } catch (err: any) {
+      sendError(res, err.status ?? 500, err.code ?? "INTERNAL_ERROR", err.message);
+    }
+  };
+
+  // PUT /api/v1/orders/:orderId/status
+  updateStatus = async (req: Request, res: Response): Promise<void> => {
+    const parsed = updateStatusSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Некорректный статус",
+        parsed.error.errors.map((e) => ({ field: e.path.join("."), message: e.message }))
+      );
+      return;
+    }
+
+    try {
+      const order = await this.orderService.updateStatus(
+        req.params.orderId,
+        parsed.data.status as OrderStatus
+      );
+      sendSuccess(res, order);
+    } catch (err: any) {
+      sendError(res, err.status ?? 500, err.code ?? "INTERNAL_ERROR", err.message, err.details);
+    }
+  };
+
+  // PUT /api/v1/orders/:orderId/courier
+  assignCourier = async (req: Request, res: Response): Promise<void> => {
+    const parsed = assignCourierSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_ERROR", "Ошибка валидации",
+        parsed.error.errors.map((e) => ({ field: e.path.join("."), message: e.message }))
+      );
+      return;
+    }
+
+    try {
+      const order = await this.orderService.assignCourier(
+        req.params.orderId,
+        parsed.data.courierId
+      );
+      sendSuccess(res, order);
+    } catch (err: any) {
+      sendError(res, err.status ?? 500, err.code ?? "INTERNAL_ERROR", err.message, err.details);
+    }
+  };
+
+  // DELETE /api/v1/orders/:orderId
+  cancelOrder = async (req: Request, res: Response): Promise<void> => {
+    try {
+      await this.orderService.cancelOrder(
+        req.params.orderId,
+        req.user!.sub,
+        req.user!.role
+      );
+      res.status(204).send();
+    } catch (err: any) {
+      sendError(res, err.status ?? 500, err.code ?? "INTERNAL_ERROR", err.message, err.details);
+    }
+  };
+}
+```
+
+---
+
+### 4.7 Регистрация маршрутов
+
+```typescript
+// src/routes/order.routes.ts
+
+import { Router } from "express";
+import { OrderController } from "../controllers/OrderController";
+import { authenticate, authorize } from "../middleware/auth";
+
+export function createOrderRouter(controller: OrderController): Router {
+  const router = Router();
+
+  // Все маршруты требуют аутентификации
+  router.use(authenticate);
+
+  // POST /api/v1/orders — создание заказа (только покупатель)
+  router.post(
+    "/orders",
+    authorize("customer"),
+    controller.createOrder
+  );
+
+  // GET /api/v1/orders — история заказов покупателя
+  router.get(
+    "/orders",
+    authorize("customer"),
+    controller.getCustomerOrders
+  );
+
+  // GET /api/v1/orders/:orderId — получение заказа по ID
+  router.get(
+    "/orders/:orderId",
+    authorize("customer", "kitchen_staff", "franchise_owner", "courier"),
+    controller.getOrderById
+  );
+
+  // PUT /api/v1/orders/:orderId/status — обновление статуса
+  router.put(
+    "/orders/:orderId/status",
+    authorize("kitchen_staff", "franchise_owner"),
+    controller.updateStatus
+  );
+
+  // PUT /api/v1/orders/:orderId/courier — назначение курьера
+  router.put(
+    "/orders/:orderId/courier",
+    authorize("franchise_owner"),
+    controller.assignCourier
+  );
+
+  // DELETE /api/v1/orders/:orderId — отмена заказа
+  router.delete(
+    "/orders/:orderId",
+    authorize("customer", "franchise_owner"),
+    controller.cancelOrder
+  );
+
+  // GET /api/v1/franchises/:franchiseId/orders — заказы франшизы
+  router.get(
+    "/franchises/:franchiseId/orders",
+    authorize("kitchen_staff", "franchise_owner"),
+    controller.getFranchiseOrders
+  );
+
+  return router;
+}
+```
+
+---
+
+### 4.8 Точка входа приложения
+
+```typescript
+// src/app.ts
+
+import express from "express";
+import { createOrderRouter } from "./routes/order.routes";
+import { OrderController } from "./controllers/OrderController";
+import { OrderService } from "./services/OrderService";
+
+// Composition Root — сборка зависимостей (DIP)
+// В реальном приложении здесь подключаются реальные реализации
+import { PostgresOrderRepository } from "./repositories/PostgresOrderRepository";
+import { RabbitMQEventPublisher } from "./publishers/RabbitMQEventPublisher";
+
+const repo = new PostgresOrderRepository();
+const publisher = new RabbitMQEventPublisher();
+const orderService = new OrderService(repo, publisher);
+const orderController = new OrderController(orderService);
+
+const app = express();
+app.use(express.json());
+
+// Регистрация маршрутов с префиксом версии (Решение 2)
+app.use("/api/v1", createOrderRouter(orderController));
+
+export default app;
+```
+
+---
+
+## Сводная таблица эндпоинтов
+
+| Метод | URL | Роль | Описание |
+|-------|-----|------|---------|
+| `POST` | `/api/v1/orders` | customer | Создание нового заказа |
+| `GET` | `/api/v1/orders` | customer | История заказов покупателя |
+| `GET` | `/api/v1/orders/:orderId` | все | Получение заказа по ID |
+| `GET` | `/api/v1/franchises/:franchiseId/orders` | kitchen_staff, franchise_owner | Заказы магазина |
+| `PUT` | `/api/v1/orders/:orderId/status` | kitchen_staff, franchise_owner | Обновление статуса заказа |
+| `PUT` | `/api/v1/orders/:orderId/courier` | franchise_owner | Назначение курьера |
+| `DELETE` | `/api/v1/orders/:orderId` | customer, franchise_owner | Отмена заказа |
