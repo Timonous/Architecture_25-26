@@ -81,7 +81,7 @@ sequenceDiagram
 ```mermaid
 classDiagram
     class User {
-        +Int id
+        +UUID id
         +String name
         +String email
         +String phone
@@ -91,18 +91,18 @@ classDiagram
     }
 
     class Franchise {
-        +Int id
+        +UUID id
         +String name
         +String address
         +String city
         +String country
-        +Int ownerId
+        +UUID ownerId
         +Boolean isActive
     }
 
     class MenuItem {
-        +Int id
-        +Int franchiseId
+        +UUID id
+        +UUID franchiseId
         +String name
         +String description
         +Decimal price
@@ -111,8 +111,8 @@ classDiagram
     }
 
     class Promotion {
-        +Int id
-        +Int franchiseId
+        +UUID id
+        +UUID franchiseId
         +String title
         +String description
         +Decimal discountPercent
@@ -122,10 +122,10 @@ classDiagram
     }
 
     class Order {
-        +Int id
-        +Int customerId
-        +Int franchiseId
-        +Int courierId
+        +UUID id
+        +UUID customerId
+        +UUID franchiseId
+        +UUID courierId
         +Enum status
         +Enum deliveryType
         +Decimal totalPrice
@@ -135,16 +135,16 @@ classDiagram
     }
 
     class OrderItem {
-        +Int id
-        +Int orderId
-        +Int menuItemId
+        +UUID id
+        +UUID orderId
+        +UUID menuItemId
         +Integer quantity
         +Decimal unitPrice
     }
 
     class Payment {
-        +Int id
-        +Int orderId
+        +UUID id
+        +UUID orderId
         +Enum method
         +Enum status
         +Decimal amount
@@ -153,9 +153,9 @@ classDiagram
     }
 
     class Delivery {
-        +Int id
-        +Int orderId
-        +Int courierId
+        +UUID id
+        +UUID orderId
+        +UUID courierId
         +Enum status
         +String routeUrl
         +DateTime assignedAt
